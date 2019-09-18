@@ -18,13 +18,19 @@
 
 package org.apache.flink;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.api.common.serialization.SimpleStringEncoder;
+import org.apache.flink.api.common.serialization.SimpleStringSchema;
 import org.apache.flink.core.fs.Path;
+import org.apache.flink.generated.IncrementSchema;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.sink.filesystem.StreamingFileSink;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
-import org.apache.flink.streaming.util.serialization.JSONKeyValueDeserializationSchema;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.util.Bytes;
 
 import java.util.Properties;
 
@@ -41,23 +47,29 @@ import java.util.Properties;
  * method, change the respective entry in the POM.xml file (simply search for 'mainClass').
  */
 public class StreamingJob {
+	private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
 	public static void main(String[] args) throws Exception {
 		// set up the streaming execution environment
 		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 		env.setParallelism(1);
-		env.enableCheckpointing(5000);
+		//env.enableCheckpointing(5000);
 
 		Properties properties = new Properties();
 		properties.setProperty("bootstrap.servers", "localhost:9092");
 		properties.setProperty("group.id", "test");
 
-		DataStream<String> events = env
-				.addSource(new FlinkKafkaConsumer<>("flink-service", new JSONKeyValueDeserializationSchema(false), properties))
-				.map(on -> on.get("value").toString());
+		DataStream<IncrementSchema> events = env
+				.addSource(new FlinkKafkaConsumer<>("flink-service", new SimpleStringSchema(), properties))
+				.map(message -> (IncrementSchema) OBJECT_MAPPER.readerFor(IncrementSchema.class).readValue(message))
+				.returns(IncrementSchema.class);
 
-		StreamingFileSink<String> sink = StreamingFileSink
-				.forRowFormat(new Path("hdfs:///flink-service"), new SimpleStringEncoder<String>("UTF-8"))
+		events.addSink(createHBaseSinkFunction());
+
+		events.print();
+
+		StreamingFileSink<IncrementSchema> sink = StreamingFileSink
+				.forRowFormat(new Path("hdfs://localhost/flink-service"), new SimpleStringEncoder<IncrementSchema>("UTF-8"))
 				.build();
 
 		events.addSink(sink);
@@ -65,4 +77,23 @@ public class StreamingJob {
 		// execute program
 		env.execute("Flink Streaming Java API Skeleton");
 	}
+
+	private static Put toPut(IncrementSchema increment) {
+		Put put = new Put(Bytes.toBytes(increment.getKey()));
+		put.addColumn(Bytes.toBytes("inc"), Bytes.toBytes("id"), Bytes.toBytes(increment.getIncrement()));
+		return put;
+	}
+
+	private static HBaseSinkFunction<IncrementSchema> createHBaseSinkFunction() {
+		Configuration config = HBaseConfiguration.create();
+		String path = StreamingJob.class
+				.getClassLoader()
+				.getResource("hbase-site.xml")
+				.getPath();
+		config.addResource(new org.apache.hadoop.fs.Path(path));
+
+		return new HBaseSinkFunction<>("flink-service", config, StreamingJob::toPut, 1, 1, 100L);
+	}
 }
+
+// {"key":"bla", "increment":"5"}
