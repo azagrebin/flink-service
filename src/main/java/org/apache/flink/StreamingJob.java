@@ -19,8 +19,12 @@
 package org.apache.flink;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.serialization.SimpleStringEncoder;
 import org.apache.flink.api.common.serialization.SimpleStringSchema;
+import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.api.common.typeutils.base.StringSerializer;
+import org.apache.flink.api.common.typeutils.base.VoidSerializer;
 import org.apache.flink.core.fs.Path;
 import org.apache.flink.generated.IncrementSchema;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -29,9 +33,16 @@ import org.apache.flink.streaming.api.functions.sink.filesystem.StreamingFileSin
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hbase.HBaseConfiguration;
+import org.apache.hadoop.hbase.client.Delete;
+import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.client.RowMutations;
 import org.apache.hadoop.hbase.util.Bytes;
 
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.Properties;
 
 /**
@@ -53,7 +64,7 @@ public class StreamingJob {
 		// set up the streaming execution environment
 		StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 		env.setParallelism(1);
-		//env.enableCheckpointing(5000);
+		env.enableCheckpointing(3000);
 
 		Properties properties = new Properties();
 		properties.setProperty("bootstrap.servers", "localhost:9092");
@@ -64,7 +75,7 @@ public class StreamingJob {
 				.map(message -> (IncrementSchema) OBJECT_MAPPER.readerFor(IncrementSchema.class).readValue(message))
 				.returns(IncrementSchema.class);
 
-		events.addSink(createHBaseSinkFunction());
+		events.keyBy(IncrementSchema::getKey).addSink(createHBaseSinkFunction());
 
 		events.print();
 
@@ -78,13 +89,7 @@ public class StreamingJob {
 		env.execute("Flink Streaming Java API Skeleton");
 	}
 
-	private static Put toPut(IncrementSchema increment) {
-		Put put = new Put(Bytes.toBytes(increment.getKey()));
-		put.addColumn(Bytes.toBytes("inc"), Bytes.toBytes("id"), Bytes.toBytes(increment.getIncrement()));
-		return put;
-	}
-
-	private static HBaseSinkFunction<IncrementSchema> createHBaseSinkFunction() {
+	private static AggregatingHBaseSinkFunction<IncrementSchema, String, Integer, Integer, Void> createHBaseSinkFunction() {
 		Configuration config = HBaseConfiguration.create();
 		String path = StreamingJob.class
 				.getClassLoader()
@@ -92,7 +97,63 @@ public class StreamingJob {
 				.getPath();
 		config.addResource(new org.apache.hadoop.fs.Path(path));
 
-		return new HBaseSinkFunction<>("flink-service", config, StreamingJob::toPut, 1, 1, 100L);
+		return new AggregatingHBaseSinkFunction<>(
+				"flink-service",
+				config,
+				StreamingJob::toPut,
+				StreamingJob::toCommit,
+				1, 1, 100L,
+				IncAggregateFunction.INSTANCE,
+				IncrementSchema::getKey,
+				StringSerializer.INSTANCE,
+				IntSerializer.INSTANCE,
+				IntSerializer.INSTANCE,
+				VoidSerializer.INSTANCE);
+	}
+
+	static List<Mutation> toPut(String key, IncrementSchema increment) {
+		Put put = new Put(Bytes.toBytes(increment.getKey()));
+		put.addColumn(Bytes.toBytes("inc"), Bytes.toBytes(increment.getId()), Bytes.toBytes(increment.getIncrement()));
+		return Collections.singletonList(put);
+	}
+
+	public static RowMutations toCommit(String key, Integer agg) {
+		RowMutations rowMutations = new RowMutations(Bytes.toBytes(key));
+		Delete delete = new Delete(Bytes.toBytes(key));
+		delete.addFamily(Bytes.toBytes("inc"));
+		Put put = new Put(Bytes.toBytes(key));
+		put.addColumn(Bytes.toBytes("inc"), Bytes.toBytes("value"), Bytes.toBytes(agg));
+		try {
+			rowMutations.add(delete);
+			rowMutations.add(put);
+		} catch (IOException e) {
+			throw new RuntimeException("Unexpected commit mutation creation failure", e);
+		}
+		return rowMutations;
+	}
+
+	private enum IncAggregateFunction implements AggregateFunction<IncrementSchema, Integer, Integer> {
+		INSTANCE;
+
+		@Override
+		public Integer createAccumulator() {
+			return 0;
+		}
+
+		@Override
+		public Integer add(IncrementSchema value, Integer accumulator) {
+			return accumulator + value.getIncrement();
+		}
+
+		@Override
+		public Integer getResult(Integer accumulator) {
+			return accumulator;
+		}
+
+		@Override
+		public Integer merge(Integer a, Integer b) {
+			return a + b;
+		}
 	}
 }
 

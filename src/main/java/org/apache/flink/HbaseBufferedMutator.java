@@ -16,18 +16,29 @@
  * limitations under the License.
  */
 
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package org.apache.flink;
 
-import org.apache.flink.addons.hbase.util.HBaseConfigurationUtil;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.state.FunctionInitializationContext;
-import org.apache.flink.runtime.state.FunctionSnapshotContext;
 import org.apache.flink.runtime.util.ExecutorThreadFactory;
-import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
-import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 import org.apache.flink.util.StringUtils;
 
-import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.TableName;
 import org.apache.hadoop.hbase.TableNotFoundException;
@@ -37,37 +48,34 @@ import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
 import org.apache.hadoop.hbase.client.Mutation;
 import org.apache.hadoop.hbase.client.RetriesExhaustedWithDetailsException;
+import org.apache.hadoop.hbase.client.RowMutations;
+import org.apache.hadoop.hbase.client.Table;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Function;
 
 /**
- * The upsert sink for HBase.
+ * The upsert sink mutator for HBase.
  *
  * <p>This class leverage {@link BufferedMutator} to buffer multiple
  * {@link org.apache.hadoop.hbase.client.Mutation Mutations} before sending the requests to cluster.
  * The buffering strategy can be configured by {@code bufferFlushMaxSizeInBytes},
  * {@code bufferFlushMaxMutations} and {@code bufferFlushIntervalMillis}.</p>
  */
-public class HBaseSinkFunction<T>
-        extends RichSinkFunction<T>
-        implements CheckpointedFunction, BufferedMutator.ExceptionListener {
+public class HbaseBufferedMutator implements BufferedMutator.ExceptionListener, AutoCloseable {
 
-    private static final long serialVersionUID = 1L;
-    private static final Logger LOG = LoggerFactory.getLogger(HBaseSinkFunction.class);
+    private static final Logger LOG = LoggerFactory.getLogger(HbaseBufferedMutator.class);
 
     private final String hTableName;
-    private final byte[] serializedConfig;
-
-    private final Function<T, Mutation> mutationRetriever;
+    private final org.apache.hadoop.conf.Configuration config;
 
     private final long bufferFlushMaxSizeInBytes;
     private final long bufferFlushMaxMutations;
@@ -75,6 +83,7 @@ public class HBaseSinkFunction<T>
 
     private transient Connection connection;
     private transient BufferedMutator mutator;
+    private transient Table table;
 
     private transient ScheduledExecutorService executor;
     private transient ScheduledFuture scheduledFuture;
@@ -90,24 +99,21 @@ public class HBaseSinkFunction<T>
      */
     private final AtomicReference<Throwable> failureThrowable = new AtomicReference<>();
 
-    public HBaseSinkFunction(
+    public HbaseBufferedMutator(
             String hTableName,
             org.apache.hadoop.conf.Configuration conf,
-            Function<T, Mutation> mutationRetriever,
             long bufferFlushMaxSizeInBytes,
             long bufferFlushMaxMutations,
             long bufferFlushIntervalMillis) {
         this.hTableName = hTableName;
         // Configuration is not serializable
-        this.serializedConfig = HBaseConfigurationUtil.serializeConfiguration(conf);
-        this.mutationRetriever = mutationRetriever;
+        this.config = conf;
         this.bufferFlushMaxSizeInBytes = bufferFlushMaxSizeInBytes;
         this.bufferFlushMaxMutations = bufferFlushMaxMutations;
         this.bufferFlushIntervalMillis = bufferFlushIntervalMillis;
     }
 
-    @Override
-    public void open(Configuration parameters) throws Exception {
+    public void open() throws Exception {
         LOG.info("start open ...");
         org.apache.hadoop.conf.Configuration config = prepareRuntimeConfiguration();
         try {
@@ -121,6 +127,7 @@ public class HBaseSinkFunction<T>
                     .listener(this)
                     .writeBufferSize(bufferFlushMaxSizeInBytes);
             this.mutator = connection.getBufferedMutator(params);
+            this.table = connection.getTable(TableName.valueOf(hTableName));
 
             if (bufferFlushIntervalMillis > 0) {
                 this.executor = Executors.newScheduledThreadPool(
@@ -152,7 +159,7 @@ public class HBaseSinkFunction<T>
         // create default configuration from current runtime env (`hbase-site.xml` in classpath) first,
         // and overwrite configuration using serialized configuration from client-side env (`hbase-site.xml` in classpath).
         // user params from client-side have the highest priority
-        org.apache.hadoop.conf.Configuration runtimeConfig = HBaseConfigurationUtil.deserializeConfiguration(serializedConfig, HBaseConfiguration.create());
+        org.apache.hadoop.conf.Configuration runtimeConfig = config;
 
         // do validation: check key option(s) in final runtime configuration
         if (StringUtils.isNullOrWhitespaceOnly(runtimeConfig.get(HConstants.ZOOKEEPER_QUORUM))) {
@@ -170,11 +177,10 @@ public class HBaseSinkFunction<T>
         }
     }
 
-    @Override
-    public void invoke(T value, Context context) throws Exception {
+    public void add(List<Mutation> mutations) throws Exception {
         checkErrorAndRethrow();
 
-        mutator.mutate(mutationRetriever.apply(value));
+        mutator.mutate(mutations);
 
         // flush when the buffer number of mutations greater than the configured max size.
         if (bufferFlushMaxMutations > 0 && numPendingRequests.incrementAndGet() >= bufferFlushMaxMutations) {
@@ -182,7 +188,11 @@ public class HBaseSinkFunction<T>
         }
     }
 
-    private void flush() throws IOException {
+    public void mutateRow(RowMutations mutations) throws IOException {
+        table.mutateRow(mutations);
+    }
+
+    public void flush() throws IOException {
         // BufferedMutator is thread-safe
         mutator.flush();
         numPendingRequests.set(0);
@@ -190,8 +200,17 @@ public class HBaseSinkFunction<T>
     }
 
     @Override
-    public void close() throws Exception {
+    public void close() {
         closed = true;
+
+        if (table != null) {
+            try {
+                table.close();
+            } catch (IOException e) {
+                LOG.warn("Exception occurs while closing HBase Table.", e);
+            }
+            this.table = null;
+        }
 
         if (mutator != null) {
             try {
@@ -220,21 +239,10 @@ public class HBaseSinkFunction<T>
     }
 
     @Override
-    public void snapshotState(FunctionSnapshotContext context) throws Exception {
-        while (numPendingRequests.get() != 0) {
-            flush();
-        }
-    }
-
-    @Override
-    public void initializeState(FunctionInitializationContext context) throws Exception {
-        // nothing to do.
-    }
-
-    @Override
     public void onException(RetriesExhaustedWithDetailsException exception, BufferedMutator mutator) throws RetriesExhaustedWithDetailsException {
         // fail the sink and skip the rest of the items
         // if the failure handler decides to throw an exception
         failureThrowable.compareAndSet(null, exception);
     }
 }
+
