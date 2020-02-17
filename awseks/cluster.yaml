@@ -1,0 +1,13 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: flink-service
+  region: us-east-2
+
+nodeGroups:
+  - name: flink-srv-eks-ng
+    instanceType: m5.large
+    desiredCapacity: 2
+    ssh:
+      allow: true # will use ~/.ssh/id_rsa.pub as the default ssh key

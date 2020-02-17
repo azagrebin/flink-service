@@ -6,6 +6,7 @@ KAFKA ?= kafka_2.12-2.3.0
 KAFKA_SERVER ?= localhost:9092
 
 KAFKA_TOPIC ?= flink-service
+SHARD_NUM ?= 8
 
 HBASE_VERSION ?= 1.3.5
 HBASE_BIN = /usr/local/Cellar/hbase/$(HBASE_VERSION)/libexec/bin
@@ -61,3 +62,22 @@ list_kafka_topics:
 
 send_kafka_messages:
 	$(KAFKA)/bin/kafka-console-producer.sh --broker-list $(KAFKA_SERVER) --topic $(KAFKA_TOPIC)
+
+aws_up: aws_k8s_start_cluster aws_kinesis_create_stream
+
+aws_down: aws_kinesis_delete_stream aws_k8s_delete_cluster
+
+aws_k8s_start_cluster:
+	eksctl create cluster -f ./awseks/cluster.yaml
+
+aws_k8s_delete_cluster:
+	eksctl delete cluster -f ./awseks/cluster.yaml
+
+aws_kinesis_create_stream:
+	aws kinesis create-stream --stream-name $(KAFKA_TOPIC) --shard-count $(SHARD_NUM)
+
+aws_kinesis_describe_stream:
+	aws kinesis describe-stream --stream-name $(KAFKA_TOPIC)
+
+aws_kinesis_delete_stream:
+	aws kinesis delete-stream --stream-name $(KAFKA_TOPIC)
